@@ -10,7 +10,7 @@ The Maven project is configured for Java 24.
 
 1. Import the repository as a Maven project in IntelliJ IDEA or another Java IDE.
 2. Select a Java 24 JDK.
-3. Run `com.malviys.MySketch.main()` from the `particle-simulation` module.
+3. Run `com.malviys.Simulation.main()` from the `gravity-lab` project.
 
 Run the automated checks from the repository root:
 
@@ -20,7 +20,7 @@ Run the automated checks from the repository root:
 
 ## Configuration
 
-The main visual configuration is near the top of `MySketch.java`:
+The main visual configuration is near the top of `Simulation.java`:
 
 ```java
 private static final float MINIMUM_ORBIT_RADIUS = 100;
