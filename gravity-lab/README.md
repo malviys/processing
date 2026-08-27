@@ -158,6 +158,25 @@ million directed force calculations. Reduce `orbitingBodyCount` if the frame
 rate is too low. For much larger systems, a Barnes-Hut quadtree would reduce the
 approximate force calculation to `O(n log n)`.
 
+### Benchmark: 1,001 bodies
+
+The following results compare both implementations under the same workload:
+
+| Implementation | Body representation | Frame rate | Frame time |
+| --- | --- | ---: | ---: |
+| `Simulation` | Objects in a list | 17 FPS | 58.8 ms |
+| `SimulationSIMD` | Parallel primitive arrays | 30 FPS | 33.3 ms |
+
+`SimulationSIMD` provides approximately **76.5% higher frame throughput**:
+
+```text
+((30 - 17) / 17) * 100 = 76.47%
+```
+
+This is about `1.76x` the FPS and a `43.3%` reduction in frame time. Actual
+results may vary with the JVM, hardware, and other processes running during the
+measurement.
+
 ## Current limitations
 
 - Bodies do not collide, bounce, or merge; softened gravity only prevents force

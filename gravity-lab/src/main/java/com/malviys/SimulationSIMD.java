@@ -83,9 +83,8 @@ public class SimulationSIMD extends PApplet {
     }
 
     /** Adds a body to the simulation. */
-    public int addBody(float mass, float radius, PVector location, PVector velocity) {
+    public int addBody(PVector location, float mass, PVector velocity) {
         requirePositiveFinite(mass, "Mass");
-        requirePositiveFinite(radius, "Radius");
         requireFinite(location, "Location");
         requireFinite(velocity, "Velocity");
 
@@ -93,7 +92,7 @@ public class SimulationSIMD extends PApplet {
         int index = bodyCount++;
 
         massArray[index] = mass;
-        radiusArray[index] = radius;
+        radiusArray[index] = radiusFromMass(mass);
         locXArray[index] = location.x;
         locYArray[index] = location.y;
         vecXArray[index] = velocity.x;
@@ -117,9 +116,6 @@ public class SimulationSIMD extends PApplet {
      * Each pair is visited once and receives equal, opposite force.
      */
     private void calcForce() {
-        Arrays.fill(accXArray, 0, bodyCount, 0.0f);
-        Arrays.fill(accYArray, 0, bodyCount, 0.0f);
-
         for (int first = 0; first < bodyCount; first++) {
             PVector firstLocation = new PVector(locXArray[first], locYArray[first]);
 
@@ -134,12 +130,15 @@ public class SimulationSIMD extends PApplet {
                 float softenedDistanceCubed = softenedDistanceSquared
                         * (float) Math.sqrt(softenedDistanceSquared);
 
-                float forceScale = G * massArray[first] * massArray[second]
+                // Calculate acceleration directly, matching Body.applyGravity().
+                float firstAccelerationScale = G * massArray[second]
                         / softenedDistanceCubed;
-                PVector forceOnFirst = displacement.copy().mult(forceScale);
-                PVector accelerationOfFirst = forceOnFirst.copy().div(massArray[first]);
-                PVector accelerationOfSecond = forceOnFirst.copy().mult(-1.0f)
-                        .div(massArray[second]);
+                float secondAccelerationScale = G * massArray[first]
+                        / softenedDistanceCubed;
+                PVector accelerationOfFirst = displacement.copy()
+                        .mult(firstAccelerationScale);
+                PVector accelerationOfSecond = displacement.copy()
+                        .mult(-secondAccelerationScale);
 
                 accXArray[first] += accelerationOfFirst.x;
                 accYArray[first] += accelerationOfFirst.y;
@@ -154,17 +153,12 @@ public class SimulationSIMD extends PApplet {
         float timeStep = FRAME_TIME / PHYSICS_SUBSTEPS;
 
         for (int i = 0; i < bodyCount; i++) {
-            PVector acceleration = new PVector(accXArray[i], accYArray[i]);
-            PVector velocity = new PVector(vecXArray[i], vecYArray[i]);
-            velocity.add(PVector.mult(acceleration, timeStep));
-
-            PVector location = new PVector(locXArray[i], locYArray[i]);
-            location.add(PVector.mult(velocity, timeStep));
-
-            vecXArray[i] = velocity.x;
-            vecYArray[i] = velocity.y;
-            locXArray[i] = location.x;
-            locYArray[i] = location.y;
+            vecXArray[i] += accXArray[i] * timeStep;
+            vecYArray[i] += accYArray[i] * timeStep;
+            locXArray[i] += vecXArray[i] * timeStep;
+            locYArray[i] += vecYArray[i] * timeStep;
+            accXArray[i] = 0.0f;
+            accYArray[i] = 0.0f;
         }
     }
 
@@ -175,9 +169,8 @@ public class SimulationSIMD extends PApplet {
         float centerY = height / 2.0f;
 
         addBody(
-                centralMass,
-                radiusFromMass(centralMass),
                 new PVector(centerX, centerY),
+                centralMass,
                 new PVector()
         );
 
@@ -197,9 +190,8 @@ public class SimulationSIMD extends PApplet {
             );
 
             addBody(
-                    orbiterMass,
-                    radiusFromMass(orbiterMass),
                     location,
+                    orbiterMass,
                     velocity
             );
         }
