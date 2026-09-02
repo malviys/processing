@@ -7,12 +7,10 @@ import java.util.List;
 
 /**
  * Processing sketch and physics engine for a collection of gravitational bodies.
- * Physics is calculated in smaller substeps to make close encounters more stable.
  */
 public class Simulation extends PApplet {
     // These are simulation units rather than real-world SI units.
     private static final float GRAVITATIONAL_CONSTANT = 9.8f;
-    private static final int PHYSICS_SUBSTEPS = 16;
     private static final float FRAME_TIME = 1.0f;
     private static final float MINIMUM_ORBIT_RADIUS = 100.0f;
     private static final float MAXIMUM_ORBIT_RADIUS = 180.0f;
@@ -110,30 +108,23 @@ public class Simulation extends PApplet {
         return this.bodies.size() - 1;
     }
 
-    /**
-     * Advances the simulation by one frame. Every substep first accumulates all
-     * accelerations from the same position state, then moves all bodies together.
-     */
+    /** Advances the simulation by one frame. */
     public void run() {
-        float timeStep = FRAME_TIME / PHYSICS_SUBSTEPS;
-
-        for (int step = 0; step < PHYSICS_SUBSTEPS; step++) {
-            // Force phase: positions remain unchanged throughout this loop.
-            for (int i = 0; i < this.bodies.size(); i++) {
-                for (int j = 0; j < this.bodies.size(); j++) {
-                    if (i != j) {
-                        this.bodies.get(i).applyGravity(
-                                this.bodies.get(j),
-                                GRAVITATIONAL_CONSTANT
-                        );
-                    }
+        // Force phase: positions remain unchanged throughout this loop.
+        for (int i = 0; i < this.bodies.size(); i++) {
+            for (int j = 0; j < this.bodies.size(); j++) {
+                if (i != j) {
+                    this.bodies.get(i).applyGravity(
+                            this.bodies.get(j),
+                            GRAVITATIONAL_CONSTANT
+                    );
                 }
             }
+        }
 
-            // Integration phase: apply the accumulated acceleration to every body.
-            for (Body body : this.bodies) {
-                body.update(timeStep);
-            }
+        // Integration phase: apply the accumulated acceleration to every body.
+        for (Body body : this.bodies) {
+            body.update(FRAME_TIME);
         }
     }
 

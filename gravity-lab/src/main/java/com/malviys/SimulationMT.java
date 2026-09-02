@@ -4,21 +4,23 @@ import processing.core.PApplet;
 import processing.core.PVector;
 
 import java.util.Arrays;
+import java.util.stream.IntStream;
 
 /**
  * A data-oriented two-dimensional n-body simulation.
  *
  * <p>Body properties are kept in parallel arrays so the same property for all
- * bodies is contiguous in memory. {@link PVector} is used as the computation
- * wrapper for force, acceleration, velocity, and position; calculated values
- * are written back to their respective arrays after every operation.</p>
+ * bodies is contiguous in memory. Pairwise forces are calculated in parallel;
+ * every worker writes to private acceleration arrays that are reduced before
+ * the integration phase.</p>
  */
-public class SimulationSIMD extends PApplet {
-    private static final float G = 9.8f;
+public class SimulationMT extends PApplet {
+    private static final float GRAVITY = 9.8f;
     private static final float FRAME_TIME = 1.0f;
     private static final int DEFAULT_ORBITER_COUNT = 1_000;
     private static final int DEFAULT_CAPACITY = DEFAULT_ORBITER_COUNT + 1;
     private static final float MINIMUM_RADIUS = 2.0f;
+    private static final int PARALLEL_BODY_THRESHOLD = 128;
 
     private float[] locXArray;
     private float[] locYArray;
@@ -28,18 +30,29 @@ public class SimulationSIMD extends PApplet {
     private float[] accYArray;
     private float[] massArray;
     private float[] radiusArray;
+    private float[][] workerAccXArrays;
+    private float[][] workerAccYArrays;
 
+    private final int workerCount;
     private int bodyCount;
 
-    public SimulationSIMD() {
+    public SimulationMT() {
         this(DEFAULT_CAPACITY);
     }
 
-    public SimulationSIMD(int initialCapacity) {
+    public SimulationMT(int initialCapacity) {
+        this(initialCapacity, Runtime.getRuntime().availableProcessors());
+    }
+
+    SimulationMT(int initialCapacity, int workerCount) {
         if (initialCapacity < 0) {
             throw new IllegalArgumentException("Initial capacity cannot be negative");
         }
+        if (workerCount <= 0) {
+            throw new IllegalArgumentException("Worker count must be positive");
+        }
 
+        this.workerCount = workerCount;
         locXArray = new float[initialCapacity];
         locYArray = new float[initialCapacity];
         vecXArray = new float[initialCapacity];
@@ -48,6 +61,8 @@ public class SimulationSIMD extends PApplet {
         accYArray = new float[initialCapacity];
         massArray = new float[initialCapacity];
         radiusArray = new float[initialCapacity];
+        workerAccXArrays = new float[workerCount][initialCapacity];
+        workerAccYArrays = new float[workerCount][initialCapacity];
     }
 
     @Override
@@ -82,21 +97,28 @@ public class SimulationSIMD extends PApplet {
     }
 
     /** Adds a body to the simulation. */
-    public int addBody(float mass, float radius, PVector location, PVector velocity) {
+    public int addBody(
+            float locationX,
+            float locationY,
+            float mass,
+            float velocityX,
+            float velocityY
+    ) {
         requirePositiveFinite(mass, "Mass");
-        requirePositiveFinite(radius, "Radius");
-        requireFinite(location, "Location");
-        requireFinite(velocity, "Velocity");
+        requireFinite(locationX, "Location X");
+        requireFinite(locationY, "Location Y");
+        requireFinite(velocityX, "Velocity X");
+        requireFinite(velocityY, "Velocity Y");
 
         ensureCapacity(bodyCount + 1);
         int index = bodyCount++;
 
         massArray[index] = mass;
-        radiusArray[index] = radius;
-        locXArray[index] = location.x;
-        locYArray[index] = location.y;
-        vecXArray[index] = velocity.x;
-        vecYArray[index] = velocity.y;
+        radiusArray[index] = radiusFromMass(mass);
+        locXArray[index] = locationX;
+        locYArray[index] = locationY;
+        vecXArray[index] = velocityX;
+        vecYArray[index] = velocityY;
         accXArray[index] = 0.0f;
         accYArray[index] = 0.0f;
 
@@ -114,11 +136,47 @@ public class SimulationSIMD extends PApplet {
      * Each pair is visited once and receives equal, opposite force.
      */
     private void calcForce() {
-        Arrays.fill(accXArray, 0, bodyCount, 0.0f);
-        Arrays.fill(accYArray, 0, bodyCount, 0.0f);
+        int activeWorkerCount = bodyCount >= PARALLEL_BODY_THRESHOLD
+                ? Math.min(workerCount, bodyCount)
+                : 1;
 
-        for (int first = 0; first < bodyCount; first++) {
+        for (int worker = 0; worker < activeWorkerCount; worker++) {
+            Arrays.fill(workerAccXArrays[worker], 0, bodyCount, 0.0f);
+            Arrays.fill(workerAccYArrays[worker], 0, bodyCount, 0.0f);
+        }
+
+        if (activeWorkerCount == 1) {
+            calculateWorkerForces(0, 1);
+        } else {
+            IntStream.range(0, activeWorkerCount)
+                    .parallel()
+                    .forEach(worker -> calculateWorkerForces(worker, activeWorkerCount));
+        }
+
+        // Parallel workers never share writable state. Combine their partial
+        // accelerations only after the parallel stream has joined.
+        for (int body = 0; body < bodyCount; body++) {
+            float accelerationX = 0.0f;
+            float accelerationY = 0.0f;
+            for (int worker = 0; worker < activeWorkerCount; worker++) {
+                accelerationX += workerAccXArrays[worker][body];
+                accelerationY += workerAccYArrays[worker][body];
+            }
+            accXArray[body] = accelerationX;
+            accYArray[body] = accelerationY;
+        }
+    }
+
+    /** Calculates a strided share of unique body pairs into worker-local arrays. */
+    private void calculateWorkerForces(int worker, int activeWorkerCount) {
+        float[] workerAccX = workerAccXArrays[worker];
+        float[] workerAccY = workerAccYArrays[worker];
+
+        // Striding spreads the expensive low first-index iterations across workers.
+        for (int first = worker; first < bodyCount; first += activeWorkerCount) {
             PVector firstLocation = new PVector(locXArray[first], locYArray[first]);
+            float firstMass = massArray[first];
+            float firstRadius = radiusArray[first];
 
             for (int second = first + 1; second < bodyCount; second++) {
                 PVector secondLocation = new PVector(locXArray[second], locYArray[second]);
@@ -126,22 +184,22 @@ public class SimulationSIMD extends PApplet {
 
                 // Softening makes the force finite when bodies overlap and limits
                 // unstable acceleration during very close encounters.
-                float softening = (radiusArray[first] + radiusArray[second]) * 0.5f;
+                float softening = (firstRadius + radiusArray[second]) * 0.5f;
                 float softenedDistanceSquared = displacement.magSq() + softening * softening;
                 float softenedDistanceCubed = softenedDistanceSquared
                         * (float) Math.sqrt(softenedDistanceSquared);
 
-                float forceScale = G * massArray[first] * massArray[second]
+                float firstAccelerationScale = GRAVITY * massArray[second]
                         / softenedDistanceCubed;
-                PVector forceOnFirst = displacement.copy().mult(forceScale);
-                PVector accelerationOfFirst = forceOnFirst.copy().div(massArray[first]);
-                PVector accelerationOfSecond = forceOnFirst.copy().mult(-1.0f)
-                        .div(massArray[second]);
+                float secondAccelerationScale = GRAVITY * firstMass
+                        / softenedDistanceCubed;
+                PVector firstAcceleration = displacement.copy().mult(firstAccelerationScale);
+                PVector secondAcceleration = displacement.copy().mult(-secondAccelerationScale);
 
-                accXArray[first] += accelerationOfFirst.x;
-                accYArray[first] += accelerationOfFirst.y;
-                accXArray[second] += accelerationOfSecond.x;
-                accYArray[second] += accelerationOfSecond.y;
+                workerAccX[first] += firstAcceleration.x;
+                workerAccY[first] += firstAcceleration.y;
+                workerAccX[second] += secondAcceleration.x;
+                workerAccY[second] += secondAcceleration.y;
             }
         }
     }
@@ -149,17 +207,12 @@ public class SimulationSIMD extends PApplet {
     /** Applies acceleration with semi-implicit Euler integration. */
     private void applyForce() {
         for (int i = 0; i < bodyCount; i++) {
-            PVector acceleration = new PVector(accXArray[i], accYArray[i]);
-            PVector velocity = new PVector(vecXArray[i], vecYArray[i]);
-            velocity.add(PVector.mult(acceleration, FRAME_TIME));
-
-            PVector location = new PVector(locXArray[i], locYArray[i]);
-            location.add(PVector.mult(velocity, FRAME_TIME));
-
-            vecXArray[i] = velocity.x;
-            vecYArray[i] = velocity.y;
-            locXArray[i] = location.x;
-            locYArray[i] = location.y;
+            vecXArray[i] += accXArray[i] * FRAME_TIME;
+            vecYArray[i] += accYArray[i] * FRAME_TIME;
+            locXArray[i] += vecXArray[i] * FRAME_TIME;
+            locYArray[i] += vecYArray[i] * FRAME_TIME;
+            accXArray[i] = 0.0f;
+            accYArray[i] = 0.0f;
         }
     }
 
@@ -169,12 +222,7 @@ public class SimulationSIMD extends PApplet {
         float centerX = width / 2.0f;
         float centerY = height / 2.0f;
 
-        addBody(
-                centralMass,
-                radiusFromMass(centralMass),
-                new PVector(centerX, centerY),
-                new PVector()
-        );
+        addBody(centerX, centerY, centralMass, 0.0f, 0.0f);
 
         for (int i = 0; i < orbiterCount; i++) {
             float progress = orbiterCount == 1 ? 0.0f : (float) i / (orbiterCount - 1);
@@ -182,20 +230,12 @@ public class SimulationSIMD extends PApplet {
             float angle = TWO_PI * i / orbiterCount;
             float speed = circularOrbitSpeed(centralMass, orbitalRadius);
 
-            PVector location = new PVector(
+            addBody(
                     centerX + cos(angle) * orbitalRadius,
-                    centerY + sin(angle) * orbitalRadius
-            );
-            PVector velocity = new PVector(
+                    centerY + sin(angle) * orbitalRadius,
+                    orbiterMass,
                     -sin(angle) * speed,
                     cos(angle) * speed
-            );
-
-            addBody(
-                    orbiterMass,
-                    radiusFromMass(orbiterMass),
-                    location,
-                    velocity
             );
         }
     }
@@ -203,7 +243,7 @@ public class SimulationSIMD extends PApplet {
     public float circularOrbitSpeed(float centralMass, float orbitalRadius) {
         requirePositiveFinite(centralMass, "Central mass");
         requirePositiveFinite(orbitalRadius, "Orbital radius");
-        return (float) Math.sqrt(G * centralMass / orbitalRadius);
+        return (float) Math.sqrt(GRAVITY * centralMass / orbitalRadius);
     }
 
     public int size() {
@@ -253,6 +293,10 @@ public class SimulationSIMD extends PApplet {
         accYArray = Arrays.copyOf(accYArray, newCapacity);
         massArray = Arrays.copyOf(massArray, newCapacity);
         radiusArray = Arrays.copyOf(radiusArray, newCapacity);
+        for (int worker = 0; worker < workerCount; worker++) {
+            workerAccXArrays[worker] = Arrays.copyOf(workerAccXArrays[worker], newCapacity);
+            workerAccYArrays[worker] = Arrays.copyOf(workerAccYArrays[worker], newCapacity);
+        }
     }
 
     private void checkBodyIndex(int index) {
@@ -267,16 +311,13 @@ public class SimulationSIMD extends PApplet {
         }
     }
 
-    private static void requireFinite(PVector vector, String property) {
-        if (vector == null
-                || !Float.isFinite(vector.x)
-                || !Float.isFinite(vector.y)
-                || !Float.isFinite(vector.z)) {
-            throw new IllegalArgumentException(property + " must be a finite vector");
+    private static void requireFinite(float value, String property) {
+        if (!Float.isFinite(value)) {
+            throw new IllegalArgumentException(property + " must be finite");
         }
     }
 
     public static void main(String[] args) {
-        PApplet.main(SimulationSIMD.class, args);
+        PApplet.main(SimulationMT.class, args);
     }
 }

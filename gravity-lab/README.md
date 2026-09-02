@@ -1,180 +1,186 @@
-# Particle Simulation
+# Gravity Lab
 
-An interactive 2D gravitational particle simulation built with Java and
-[Processing](https://processing.org/). A central body and a configurable number
-of smaller bodies move under their mutual gravity.
+An interactive 2D gravitational particle simulation built with Java 24 and
+[Processing](https://processing.org/). The project contains several versions of
+the same n-body simulation for comparing object-oriented, data-oriented,
+off-heap, multithreaded, and SIMD implementations.
 
-## Running the project
+## Requirements
 
-The Maven project is configured for Java 24.
+- JDK 24
+- Maven 3.9 or newer
+- An IDE that can run Processing `PApplet` classes, such as IntelliJ IDEA
 
-1. Import the repository as a Maven project in IntelliJ IDEA or another Java IDE.
-2. Select a Java 24 JDK.
-3. Run `com.malviys.Simulation.main()` from the `gravity-lab` project.
+`SimulationSIMDV` uses the incubating Vector API. The Maven compiler and test
+configuration in `pom.xml` already enable `jdk.incubator.vector`.
 
-Run the automated checks from the repository root:
+## Build
+
+Run from this directory:
 
 ```shell
-./mvnw -pl particle-simulation -am test
+mvn compile
 ```
 
-## Configuration
+The JDK prints a warning when compiling or running incubator modules. This is
+expected for the Vector API.
 
-The main visual configuration is near the top of `Simulation.java`:
+## Simulation implementations
 
-```java
-private static final float MINIMUM_ORBIT_RADIUS = 100;
-private static final float MAXIMUM_ORBIT_RADIUS = 180;
+| Main class | Storage and execution model |
+| --- | --- |
+| `Simulation` | Reference implementation using a list of body objects and `PVector` values |
+| `SimulationSIMD` | Structure-of-arrays using ordinary `float[]` calculations |
+| `SimulationMT` | Structure-of-arrays with parallel pair calculations and worker-local acceleration arrays |
+| `SimulationArena` | Off-heap structure-of-arrays stored in one contiguous Arena allocation |
+| `SimulationSIMDV` | Structure-of-arrays with explicit SIMD calculations using the incubator Vector API |
+| `SimulationGPU` | Experimental Processing shader implementation |
 
-int orbitingBodyCount = 10_00;
+Run the desired class's `main()` method from the IDE. For example:
+
+```text
+com.malviys.Simulation.main()
+com.malviys.SimulationArena.main()
+com.malviys.SimulationSIMDV.main()
 ```
 
-`orbitingBodyCount` does not include the central body. Therefore, a value of
-`1000` creates 1001 total bodies.
+Add this VM option when running `SimulationSIMDV`:
 
-The initial masses are configured in `setup()`:
-
-```java
-float centralMass = 200;
-float orbitingMass = 0.1f;
+```text
+--add-modules jdk.incubator.vector
 ```
-
-The orbiters are intentionally much lighter than the center. This makes the
-central mass dominate the system and reduces chaotic scattering between
-orbiters.
 
 ## Initial orbital system
 
-The central body starts at the center of the `800 x 600` canvas with zero
-velocity. Orbiting bodies are distributed across:
+The default scene contains one central body and 1,000 orbiters on an `800 x
+600` canvas. The central body has a mass of `200`, and every orbiter has a mass
+of `0.1`.
 
-- angles from `0` through `2π`;
-- radii between `MINIMUM_ORBIT_RADIUS` and `MAXIMUM_ORBIT_RADIUS`.
-
-For an orbital position with angle `θ` and radius `r`, its location is:
-
-```text
-x = centerX + cos(θ) * r
-y = centerY + sin(θ) * r
-```
-
-The ideal circular speed around a dominant central mass is:
+Orbiters are distributed between radii `100` and `180`. For angle `theta` and
+orbital radius `r`, the initial position is:
 
 ```text
-v = sqrt(G * centralMass / r)
+x = centerX + cos(theta) * r
+y = centerY + sin(theta) * r
 ```
 
-Velocity points perpendicular to the radius:
+The circular-orbit speed around the central mass is:
 
 ```text
-vx = -sin(θ) * v
-vy =  cos(θ) * v
+speed = sqrt(G * centralMass / r)
 ```
 
-This gives each body tangential motion instead of sending it directly toward or
-away from the center.
+Velocity is perpendicular to the radius:
 
-## Gravity calculation
+```text
+vx = -sin(theta) * speed
+vy =  cos(theta) * speed
+```
 
-For each body, the simulation adds the acceleration caused by every other body.
-The gravitational constant is `G = 0.98` in simulation units.
+The simulation uses `G = 9.8` in visualization units.
 
-Plain Newtonian gravity contains a division by `distance²`. At zero distance,
-that becomes infinite and can produce `NaN` values. Very small distances can
-also create enormous acceleration and throw bodies off screen.
+## Gravity and integration
 
-This project uses softened gravity:
+Every unique body pair receives equal and opposite gravitational effects. The
+calculation uses softened gravity so overlapping or closely passing bodies do
+not produce infinite acceleration:
 
 ```text
 acceleration = G * otherMass * displacement
-               / (distance² + epsilon²)^(3/2)
+               / (distanceSquared + epsilonSquared)^(3/2)
 ```
 
-The softening length `epsilon` is half the sum of the two bodies' visual radii.
-At long distances the equation behaves like ordinary gravity. At short
-distances it smoothly limits the attraction and remains finite, including when
-two bodies overlap exactly.
+The softening length is half the sum of the two visual radii.
 
-The accelerated body's own mass is absent from this equation because it cancels
-when gravitational force is divided by that body's mass:
+One call to `run()` performs one force calculation and one full-frame
+semi-implicit Euler update. There are no physics substeps:
 
 ```text
-F = G * firstMass * secondMass / distance²
-a = F / firstMass
+velocity = velocity + acceleration * frameTime
+position = position + velocity * frameTime
 ```
 
-## Simulation step
+All forces are calculated from the same position state before any body moves.
 
-One call to `Simulation.run()` represents one rendered frame. It divides that
-frame into 16 physics substeps:
+## Arena memory layout
+
+`SimulationArena` allocates one large native-memory block through a Java
+`Arena`. The block contains eight contiguous float sequences:
 
 ```text
-substep time = 1 / 16
+[locationX]
+[locationY]
+[velocityX]
+[velocityY]
+[accelerationX]
+[accelerationY]
+[mass]
+[radius]
 ```
 
-Each substep has two phases:
-
-1. Calculate and accumulate gravity for every body without moving anything.
-2. Update all velocities and positions together.
-
-Separating these phases matters. If a body moved immediately after calculating
-its force, later bodies would see a mixture of old and new positions. The result
-would depend on list order and would not preserve force symmetry.
-
-Position and velocity use semi-implicit Euler integration:
+For capacity `N`, each component occupies `N * Float.BYTES`. A component's byte
+offset is therefore:
 
 ```text
-velocity = velocity + acceleration * dt
-position = position + velocity * dt
+componentOffset = componentIndex * N * Float.BYTES
 ```
 
-Updating velocity first is generally more stable for orbital motion than
-explicit Euler integration. Acceleration is reset after each substep because it
-will be recalculated from the next set of positions.
+`MemorySegment.asSlice()` turns each region into a component segment. When the
+simulation outgrows its capacity, it allocates a larger block, copies the active
+values component by component, and closes the Arena that owned the old block.
+
+## Vector API implementation
+
+`SimulationSIMDV` uses `FloatVector.SPECIES_PREFERRED`, allowing the JVM to
+select the preferred SIMD width for the current processor.
+
+For each first body, the force loop:
+
+1. Broadcasts its position, radius, and mass across the SIMD lanes.
+2. Loads a contiguous batch of second bodies from the component arrays.
+3. Calculates displacement, softening, distance, and acceleration lane-wise.
+4. Reduces the first body's lane results and writes the opposite acceleration
+   back to the second bodies.
+5. Uses a scalar loop only for the final bodies that do not fill a complete
+   vector.
+
+Velocity and position integration are also vectorized. The sketch displays the
+selected SIMD lane count alongside its FPS and body count.
 
 ## Body size
 
-Visual radius is calculated from mass:
+Visual radius is calculated from mass when a radius is not supplied explicitly:
 
 ```text
 radius = max(2, sqrt(mass))
 ```
 
-The square root keeps a heavy body from becoming excessively large and makes its
-2D area approximately proportional to mass. The minimum radius keeps very light
-orbiters visible.
+The square root makes 2D area approximately proportional to mass, while the
+minimum radius keeps light orbiters visible.
 
 ## Performance
 
-The current force calculation compares every body with every other body, making
-its complexity:
+The exact pairwise force calculation has `O(bodyCount²)` time complexity.
+The data-oriented variants visit each unique pair once, resulting in about
+500,000 pair interactions per frame for 1,001 bodies.
 
-```text
-O(substeps * bodyCount²)
-```
+- `SimulationMT` distributes pair ranges across CPU workers.
+- `SimulationSIMDV` processes several second bodies per SIMD operation.
+- `SimulationArena` keeps component values contiguous in off-heap memory.
 
-With 1001 total bodies and 16 substeps, one rendered frame performs about 16
-million directed force calculations. Reduce `orbitingBodyCount` if the frame
-rate is too low. For much larger systems, a Barnes-Hut quadtree would reduce the
-approximate force calculation to `O(n log n)`.
+These approaches improve execution and memory behavior but do not change the
+quadratic algorithm. A spatial approximation such as Barnes-Hut would be needed
+to reduce the algorithmic complexity for much larger systems.
 
 ## Current limitations
 
-- Bodies do not collide, bounce, or merge; softened gravity only prevents force
-  singularities.
-- There are no canvas boundaries. A sufficiently disturbed body can leave the
-  visible area.
-- The units are designed for visualization and are not SI units.
-- Semi-implicit Euler is stable enough for this demonstration but still
-  accumulates numerical error over long runs.
-- Circular speed assumes the center dominates and does not include every
-  orbiter's gravitational perturbation.
+- Bodies do not collide, bounce, or merge.
+- There are no canvas boundaries.
+- The units are intended for visualization and are not SI units.
+- Semi-implicit Euler accumulates numerical error over long runs.
+- Circular speed assumes the central body dominates the system.
 
 ## Tests
 
-`SimulationTest` verifies that:
-
-- circular speed uses the configured gravity constant;
-- visual radius scales with mass;
-- the initial orbital arrangement remains on screen for 1000 frames;
-- overlapping bodies remain finite instead of producing `NaN`.
+`SimulationTest` checks circular-orbit speed, radius scaling, long-running orbit
+stability, and finite results for overlapping bodies.
